@@ -136,3 +136,4 @@ See [examples](examples/)
 - [ ] Add proper error handling
 - [ ] Check that there are no jumps to the patched code
 - [ ] Fix other edge cases
+- [ ] Document the code and public API
