@@ -1,8 +1,4 @@
-#include <Zydis/Encoder.h>
 #include <assert.h>
-#include <emmintrin.h>
-#include <smmintrin.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
@@ -12,7 +8,6 @@
 #include <memory.h>
 
 #include <Zydis/Zydis.h>
-#include <xmmintrin.h>
 
 #include "tinyhooks.h"
 
@@ -58,7 +53,6 @@ struct tinyhook_enter_context
     size_t r9;
 
     size_t rax;
-    size_t r10;
 };
 
 struct tinyhook_leave_context
@@ -79,7 +73,7 @@ typedef struct
 typedef struct
 {
     uint64_t ret;
-    uint64_t saved;
+    uint64_t ret_stackaddr;
 
     uint64_t magic;
 
@@ -89,9 +83,10 @@ typedef struct
     void *func;
 
     void (*tinyhook_enter)();
+    void (*tinyhook_leave)();
 
-    size_t  replaced_prologue_size;
     uint8_t replaced_prologue[MAX_PROLOGUE_SIZE];
+    size_t  replaced_prologue_size;
 
     struct
     {
@@ -99,6 +94,8 @@ typedef struct
         uint8_t jmp_ptr[JMP_PTR_SIZE];
         uint8_t prologue[MAX_PROLOGUE_SIZE];
         uint8_t jmp[JMP_SIZE];
+        uint8_t ret_lea[LEA_SIZE];
+        uint8_t ret_jmp_ptr[JMP_PTR_SIZE];
     } insns;
 } trampoline_t;
 
@@ -119,8 +116,9 @@ typedef struct
 static page_allocator_t page_allocator;
 
 extern void tinyhook_enter();
+extern void tinyhook_leave();
 
-void
+trampoline_t *
 do_pre_hooks(trampoline_t *trampoline, tinyhook_enter_context_t *ctx)
 {
     for (tinyhook_t *hook = trampoline->pre.head; hook != NULL; hook = hook->next)
@@ -130,9 +128,11 @@ do_pre_hooks(trampoline_t *trampoline, tinyhook_enter_context_t *ctx)
 
         callback(ctx, data);
     }
+
+    return trampoline;
 }
 
-void
+trampoline_t *
 do_post_hooks(trampoline_t *trampoline, tinyhook_leave_context_t *ctx)
 {
     for (tinyhook_t *hook = trampoline->post.head; hook != NULL; hook = hook->next)
@@ -142,6 +142,8 @@ do_post_hooks(trampoline_t *trampoline, tinyhook_leave_context_t *ctx)
 
         callback(ctx, data);
     }
+
+    return trampoline;
 }
 
 static uint64_t
@@ -345,6 +347,9 @@ alloc_trampoline(void *func, void *pivot)
 static void
 dealloc_trampoline(trampoline_t *trampoline)
 {
+    if (trampoline->ret)
+        *(void **)trampoline->ret_stackaddr = (void *)trampoline->ret;
+
     void *func = trampoline->func;
 
     unprotect_region(func, trampoline->replaced_prologue_size);
@@ -450,6 +455,7 @@ create_trampoline(void *func)
         return NULL;
 
     trampoline->tinyhook_enter = tinyhook_enter;
+    trampoline->tinyhook_leave = tinyhook_leave;
     trampoline->func           = func;
 
     int32_t shift = trampoline->insns.prologue - insns;
@@ -542,6 +548,42 @@ create_trampoline(void *func)
         },
     };
 
+    ZydisEncoderRequest ret_lea_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_LEA,
+        .operand_count = 2,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_REGISTER,
+                .reg.value = ZYDIS_REGISTER_R11,
+            },
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)trampoline - ((uint64_t)trampoline->insns.ret_lea + LEA_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
+    ZydisEncoderRequest ret_jmp_ptr_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_JMP,
+        .operand_count = 1,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)&trampoline->tinyhook_leave - ((uint64_t)trampoline->insns.ret_jmp_ptr + JMP_PTR_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
     size_t     len;
     ZyanStatus status;
 
@@ -555,6 +597,14 @@ create_trampoline(void *func)
 
     len    = sizeof(trampoline->insns.jmp);
     status = ZydisEncoderEncodeInstruction(&jmp_req, trampoline->insns.jmp, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.ret_lea);
+    status = ZydisEncoderEncodeInstruction(&ret_lea_req, trampoline->insns.ret_lea, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.ret_jmp_ptr);
+    status = ZydisEncoderEncodeInstruction(&ret_jmp_ptr_req, trampoline->insns.ret_jmp_ptr, &len);
     assert(ZYAN_SUCCESS(status));
 
     ZydisEncoderRequest jmp_trampoline_req = {
