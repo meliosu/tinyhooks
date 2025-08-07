@@ -115,7 +115,7 @@ The results are for **Ryzen 5 7600X**.
 
 |frida-gum|tinyhooks|
 |---------|---------|
-|181.62 ns./iter.|13.16 ns./iter.|
+|181.62 ns./iter.|12.91 ns./iter.|
 
 ## Stack traces
 
@@ -132,8 +132,8 @@ See [examples](examples/)
 
 
 ## TODO
-- [ ] Allow near jumps to be relocated
+- [x] Allow near jumps to be relocated
+- [x] Document the code and public API
 - [ ] Add proper error handling
 - [ ] Check that there are no jumps to the patched code
 - [ ] Fix other edge cases
-- [ ] Document the code and public API
