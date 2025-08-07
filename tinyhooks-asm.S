@@ -1,5 +1,5 @@
 #define CONTINUE_OFFSET 125
-#define RETURN_OFFSET 149
+#define RETURN_OFFSET 155
 
 .intel_syntax noprefix
 

@@ -21,6 +21,8 @@
 #define JMP_PTR_SIZE 6
 #define LEA_SIZE 7
 #define MAX_PROLOGUE_SIZE (MAX_INSN_SIZE + JMP_SIZE - 1)
+#define MAX_RELOCATED_SIZE 25
+#define JMP_OPCODE 0xe9
 
 struct tinyhook
 {
@@ -66,6 +68,12 @@ struct tinyhook_leave_context
 
 typedef struct
 {
+    ZydisDecodedInstruction insn;
+    ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
+} insn_t;
+
+typedef struct
+{
     tinyhook_t *head;
     tinyhook_t *tail;
 } hook_list_t;
@@ -92,7 +100,7 @@ typedef struct
     {
         uint8_t lea[LEA_SIZE];
         uint8_t jmp_ptr[JMP_PTR_SIZE];
-        uint8_t prologue[MAX_PROLOGUE_SIZE];
+        uint8_t prologue[MAX_RELOCATED_SIZE];
         uint8_t jmp[JMP_SIZE];
         uint8_t ret_lea[LEA_SIZE];
         uint8_t ret_jmp_ptr[JMP_PTR_SIZE];
@@ -117,6 +125,129 @@ static page_allocator_t page_allocator;
 
 extern void tinyhook_enter();
 extern void tinyhook_leave();
+
+static int
+get_insns(void *func, size_t func_sz, insn_t insns[JMP_SIZE], size_t *ninsns, size_t *offset)
+{
+    *offset = 0;
+    *ninsns = 0;
+
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+
+    while (*offset < JMP_SIZE)
+    {
+        insn_t *insn = &insns[*ninsns];
+
+        ZyanStatus status
+            = ZydisDecoderDecodeFull(&decoder, func + *offset, -1, &insn->insn, insn->operands);
+
+        if (!ZYAN_SUCCESS(status))
+            return -1;
+
+        if (*offset >= func_sz && insn->insn.mnemonic != ZYDIS_MNEMONIC_NOP
+            && insn->insn.mnemonic != ZYDIS_MNEMONIC_INT3)
+            return -1;
+
+        *ninsns += 1;
+        *offset += insn->insn.length;
+    }
+
+    return 0;
+}
+
+static void *
+get_pivot(void *func, insn_t *insns, size_t ninsns)
+{
+    size_t offset = 0;
+
+    for (size_t i = 0; i < ninsns; i++)
+    {
+        ZydisDecodedInstruction *insn     = &insns[i].insn;
+        ZydisDecodedOperand     *operands = insns[i].operands;
+
+        for (int j = 0; j < insn->operand_count; j++)
+        {
+            ZydisDecodedOperand *operand = &operands[j];
+
+            if (operand->type == ZYDIS_OPERAND_TYPE_MEMORY
+                && operand->mem.base == ZYDIS_REGISTER_RIP)
+                return func + offset + insn->length + operand->mem.disp.value;
+            else if (
+                operand->type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operand->imm.is_relative
+                && operand->size == 32)
+                return func + offset + insn->length + operand->imm.value.s;
+        }
+
+        offset += insn->length;
+    }
+
+    return NULL;
+}
+
+static int
+relocate(void *func, insn_t *insns, size_t ninsns, void *buffer, size_t *buffer_sz)
+{
+    size_t input_offset  = 0;
+    size_t output_offset = 0;
+
+    for (size_t i = 0; i < ninsns; i++)
+    {
+        ZydisDecodedInstruction *insn     = &insns[i].insn;
+        ZydisDecodedOperand     *operands = insns[i].operands;
+
+        if (insn->attributes & ZYDIS_ATTRIB_IS_RELATIVE)
+        {
+            for (int j = 0; j < insn->operand_count; j++)
+            {
+                ZydisDecodedOperand *operand = &operands[j];
+
+                if (operand->type == ZYDIS_OPERAND_TYPE_MEMORY
+                    && operand->mem.base == ZYDIS_REGISTER_RIP)
+                {
+                    operand->mem.disp.value
+                        = (uint64_t)func + input_offset + insn->length + operand->mem.disp.value;
+                }
+                else if (operand->type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operand->imm.is_signed)
+                {
+                    operand->size = 32;
+                    operand->imm.value.u
+                        = (uint64_t)func + input_offset + insn->length + operand->imm.value.s;
+                }
+            }
+
+            ZydisEncoderRequest req;
+            ZyanStatus          status = ZydisEncoderDecodedInstructionToEncoderRequest(
+                insn, operands, insn->operand_count, &req);
+
+            if (!ZYAN_SUCCESS(status))
+                return -1;
+
+            size_t len = *buffer_sz - output_offset;
+            status     = ZydisEncoderEncodeInstructionAbsolute(
+                &req, buffer + output_offset, &len, (uint64_t)func + input_offset);
+
+            if (!ZYAN_SUCCESS(status))
+                return -1;
+
+            input_offset += insn->length;
+            output_offset += len;
+        }
+        else
+        {
+            if (output_offset + insn->length > *buffer_sz)
+                return -1;
+
+            memcpy(buffer + output_offset, func + input_offset, insn->length);
+            input_offset += insn->length;
+            output_offset += insn->length;
+        }
+    }
+
+    *buffer_sz = output_offset;
+
+    return 0;
+}
 
 trampoline_t *
 do_pre_hooks(trampoline_t *trampoline, tinyhook_enter_context_t *ctx)
@@ -377,25 +508,12 @@ dealloc_trampoline(trampoline_t *trampoline)
 static trampoline_t *
 get_trampoline(void *func)
 {
-    ZyanU8 *insns = func;
+    uint8_t *insns = func;
 
-    ZydisDecoder decoder;
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-
-    ZydisDecodedInstruction insn;
-    ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
-    ZydisDecoderDecodeFull(&decoder, insns, -1, &insn, operands);
-
-    bool is_relative_jump = insn.mnemonic == ZYDIS_MNEMONIC_JMP && insn.operand_count == 2
-                            && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE
-                            && operands[0].size == 32
-                            && operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER
-                            && operands[1].reg.value == ZYDIS_REGISTER_RIP;
-
-    if (!is_relative_jump)
+    if (insns[0] != JMP_OPCODE)
         return NULL;
 
-    void         *target     = func + operands[0].imm.value.u + insn.length;
+    void         *target     = func + *(int32_t *)(insns + 1) + 5;
     trampoline_t *trampoline = target - offsetof(trampoline_t, insns);
 
     if (round_page_down(target) != round_page_down(trampoline))
@@ -407,99 +525,9 @@ get_trampoline(void *func)
     return trampoline;
 }
 
-static trampoline_t *
-create_trampoline(void *func)
+static void
+fill_trampoline_insns(trampoline_t *trampoline, void *func, size_t insns_sz)
 {
-    ZyanU8 *insns = func;
-
-    ZydisDecoder decoder;
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-
-    ZyanU64 offset = 0;
-    void   *pivot  = NULL;
-
-    ZydisDecodedInstruction insn;
-    ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
-
-    while (offset < JMP_SIZE
-           && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, insns + offset, -1, &insn, operands)))
-    {
-        if (insn.attributes & ZYDIS_ATTRIB_IS_RELATIVE)
-        {
-            for (int i = 0; i < insn.operand_count; i++)
-            {
-                if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[i].imm.is_relative)
-                {
-                    if (operands[i].size != 32)
-                        return NULL;
-
-                    pivot = insns + offset + operands[i].imm.value.s + insn.length;
-                }
-                else if (
-                    operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY
-                    && operands[i].mem.base == ZYDIS_REGISTER_RIP)
-                {
-                    if (!operands[i].mem.disp.has_displacement)
-                        return NULL;
-
-                    pivot = insns + offset + operands[i].mem.disp.value + insn.length;
-                }
-            }
-        }
-
-        offset += insn.length;
-    }
-
-    trampoline_t *trampoline = alloc_trampoline(func, pivot);
-    if (!trampoline)
-        return NULL;
-
-    trampoline->tinyhook_enter = tinyhook_enter;
-    trampoline->tinyhook_leave = tinyhook_leave;
-    trampoline->func           = func;
-
-    int32_t shift = trampoline->insns.prologue - insns;
-
-    offset = 0;
-
-    while (offset < JMP_SIZE
-           && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, insns + offset, -1, &insn, operands)))
-    {
-        if (insn.attributes & ZYDIS_ATTRIB_IS_RELATIVE)
-        {
-            for (int i = 0; i < insn.operand_count; i++)
-            {
-                if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && operands[i].imm.is_relative)
-                {
-                    operands[i].imm.value.s += shift;
-                }
-                else if (
-                    operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY
-                    && operands[i].mem.base == ZYDIS_REGISTER_RIP)
-                {
-                    operands[i].mem.disp.value += shift;
-                }
-            }
-
-            ZydisEncoderRequest req;
-            ZydisEncoderDecodedInstructionToEncoderRequest(
-                &insn, operands, insn.operand_count, &req);
-
-            ZyanUSize insn_len = insn.length;
-            ZydisEncoderEncodeInstruction(&req, trampoline->insns.prologue + offset, &insn_len);
-        }
-        else
-            memcpy(trampoline->insns.prologue + offset, insns + offset, insn.length);
-
-        memcpy(trampoline->replaced_prologue + offset, insns + offset, insn.length);
-        offset += insn.length;
-    }
-
-    trampoline->replaced_prologue_size = offset;
-
-    if (offset < MAX_PROLOGUE_SIZE)
-        ZydisEncoderNopFill(trampoline->insns.prologue + offset, MAX_PROLOGUE_SIZE - offset);
-
     ZydisEncoderRequest lea_req = {
         .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
         .mnemonic = ZYDIS_MNEMONIC_LEA,
@@ -543,7 +571,7 @@ create_trampoline(void *func)
         .operands = {
             (ZydisEncoderOperand){
                 .type = ZYDIS_OPERAND_TYPE_IMMEDIATE,
-                .imm.s = (uint64_t)(func + offset) - ((uint64_t)trampoline->insns.jmp + JMP_SIZE),
+                .imm.s = (uint64_t)(func + insns_sz) - ((uint64_t)trampoline->insns.jmp + JMP_SIZE),
             },
         },
     };
@@ -606,6 +634,53 @@ create_trampoline(void *func)
     len    = sizeof(trampoline->insns.ret_jmp_ptr);
     status = ZydisEncoderEncodeInstruction(&ret_jmp_ptr_req, trampoline->insns.ret_jmp_ptr, &len);
     assert(ZYAN_SUCCESS(status));
+}
+
+static trampoline_t *
+create_trampoline(void *func)
+{
+    int    ret;
+    insn_t insns[JMP_SIZE];
+    size_t ninsns;
+    size_t insns_sz;
+
+    ret = get_insns(func, -1, insns, &ninsns, &insns_sz);
+    if (ret < 0)
+        return NULL;
+
+    void *pivot = get_pivot(func, insns, ninsns);
+
+    trampoline_t *trampoline = alloc_trampoline(func, pivot);
+    if (!trampoline)
+        return NULL;
+
+    memcpy(trampoline->replaced_prologue, func, insns_sz);
+    trampoline->replaced_prologue_size = insns_sz;
+
+    trampoline->tinyhook_enter = tinyhook_enter;
+    trampoline->tinyhook_leave = tinyhook_leave;
+    trampoline->func           = func;
+
+    size_t len = MAX_RELOCATED_SIZE;
+
+    ret = relocate(func, insns, ninsns, trampoline->insns.prologue, &len);
+    if (ret < 0)
+    {
+        dealloc_trampoline(trampoline);
+        return NULL;
+    }
+
+    if (len < MAX_RELOCATED_SIZE)
+        ZydisEncoderNopFill(trampoline->insns.prologue + len, MAX_RELOCATED_SIZE - len);
+
+    fill_trampoline_insns(trampoline, func, insns_sz);
+
+    ret = unprotect_region(func, insns_sz);
+    if (ret < 0)
+    {
+        dealloc_trampoline(trampoline);
+        return NULL;
+    }
 
     ZydisEncoderRequest jmp_trampoline_req = {
         .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
@@ -614,21 +689,19 @@ create_trampoline(void *func)
         .operands = {
             (ZydisEncoderOperand){
                 .type = ZYDIS_OPERAND_TYPE_IMMEDIATE,
-                .imm.s = (uint64_t)trampoline->insns.lea - (uint64_t)(func + JMP_SIZE)
+                .imm.s = (uint64_t)&trampoline->insns - (uint64_t)(func + JMP_SIZE)
             },
         },
     };
 
-    unprotect_region(func, offset);
-
-    len    = JMP_SIZE;
-    status = ZydisEncoderEncodeInstruction(&jmp_trampoline_req, func, &len);
+    len               = JMP_SIZE;
+    ZyanStatus status = ZydisEncoderEncodeInstruction(&jmp_trampoline_req, func, &len);
     assert(ZYAN_SUCCESS(status));
 
-    if (offset > JMP_SIZE)
-        ZydisEncoderNopFill(func + JMP_SIZE, offset - JMP_SIZE);
+    if (insns_sz > JMP_SIZE)
+        ZydisEncoderNopFill(func + JMP_SIZE, insns_sz - JMP_SIZE);
 
-    protect_region(func, offset);
+    protect_region(func, insns_sz);
 
     return trampoline;
 }
@@ -660,6 +733,27 @@ add_hook(trampoline_t *trampoline, tinyhook_t *hook)
         hook->prev       = list->tail;
         list->tail       = hook;
     }
+}
+
+static void
+remove_hook(trampoline_t *trampoline, tinyhook_t *hook)
+{
+    hook_list_t *list;
+
+    if (hook->is_enter)
+        list = &trampoline->pre;
+    else
+        list = &trampoline->post;
+
+    if (hook->prev)
+        hook->prev->next = hook->next;
+    else
+        list->head = hook->next;
+
+    if (hook->next)
+        hook->next->prev = hook->prev;
+    else
+        list->tail = hook->prev;
 }
 
 static tinyhook_t *
@@ -696,6 +790,7 @@ tinyhook_attach(tinyhook_t *hook, void *func)
 
     hook->trampoline = trampoline;
     add_hook(trampoline, hook);
+
     return 0;
 }
 
@@ -706,24 +801,8 @@ tinyhook_detach(tinyhook_t *hook)
     if (!trampoline)
         return -1;
 
-    hook_list_t *list;
-
-    if (hook->is_enter)
-        list = &trampoline->pre;
-    else
-        list = &trampoline->post;
-
-    if (hook->prev)
-        hook->prev->next = hook->next;
-    else
-        list->head = hook->next;
-
-    if (hook->next)
-        hook->next->prev = hook->prev;
-    else
-        list->tail = hook->prev;
-
     hook->trampoline = NULL;
+    remove_hook(trampoline, hook);
 
     if (!trampoline->pre.head && !trampoline->post.head)
         dealloc_trampoline(trampoline);
