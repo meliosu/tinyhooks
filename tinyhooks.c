@@ -1,3 +1,4 @@
+#include <Zydis/Encoder.h>
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -698,7 +699,7 @@ relocate(void *func, insn_t *insns, size_t ninsns, void *buffer, size_t *buffer_
 
             size_t len = *buffer_sz - output_offset;
             status     = ZydisEncoderEncodeInstructionAbsolute(
-                &req, buffer + output_offset, &len, (uint64_t)func + input_offset);
+                &req, buffer + output_offset, &len, (uint64_t)buffer + output_offset);
 
             if (!ZYAN_SUCCESS(status))
                 return -1;
