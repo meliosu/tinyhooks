@@ -20,8 +20,8 @@
 #define JMP_SIZE 5
 #define JMP_PTR_SIZE 6
 #define LEA_SIZE 7
-#define MAX_PROLOGUE_SIZE (MAX_INSN_SIZE + JMP_SIZE - 1)
-#define MAX_RELOCATED_SIZE 25
+#define MAX_THUNK_SIZE (MAX_INSN_SIZE + JMP_SIZE - 1)
+#define MAX_RELOCATED_SIZE 25 // TODO: remove this magic constant
 #define JMP_OPCODE 0xe9
 
 struct tinyhook
@@ -80,9 +80,11 @@ typedef struct
 
 typedef struct
 {
-    uint64_t ret;
-    uint64_t ret_stackaddr;
+    uint64_t retaddr;
+    uint64_t ptr_to_retaddr;
 
+    // Magic value to differentiate trampolines created by the library
+    // from a random jump target. See `get_trampoline`.
     uint64_t magic;
 
     hook_list_t pre;
@@ -90,17 +92,20 @@ typedef struct
 
     void *func;
 
+    // We need those pointers because the trampoline
+    // may be further than ~2GiB away from those functions,
+    // so we use an indirect call
     void (*tinyhook_enter)();
     void (*tinyhook_leave)();
 
-    uint8_t replaced_prologue[MAX_PROLOGUE_SIZE];
-    size_t  replaced_prologue_size;
+    uint8_t orig_thunk[MAX_THUNK_SIZE];
+    size_t  orig_thunk_sz;
 
     struct
     {
         uint8_t lea[LEA_SIZE];
         uint8_t jmp_ptr[JMP_PTR_SIZE];
-        uint8_t prologue[MAX_RELOCATED_SIZE];
+        uint8_t thunk[MAX_RELOCATED_SIZE];
         uint8_t jmp[JMP_SIZE];
         uint8_t ret_lea[LEA_SIZE];
         uint8_t ret_jmp_ptr[JMP_PTR_SIZE];
@@ -125,6 +130,474 @@ static page_allocator_t page_allocator;
 
 extern void tinyhook_enter();
 extern void tinyhook_leave();
+
+trampoline_t *
+do_pre_hooks(trampoline_t *trampoline, tinyhook_enter_context_t *ctx)
+{
+    for (tinyhook_t *hook = trampoline->pre.head; hook != NULL; hook = hook->next)
+    {
+        tinyhook_enter_callback_t callback = hook->callback;
+        void                     *data     = hook->data;
+
+        callback(ctx, data);
+    }
+
+    return trampoline;
+}
+
+trampoline_t *
+do_post_hooks(trampoline_t *trampoline, tinyhook_leave_context_t *ctx)
+{
+    for (tinyhook_t *hook = trampoline->post.head; hook != NULL; hook = hook->next)
+    {
+        tinyhook_leave_callback_t callback = hook->callback;
+        void                     *data     = hook->data;
+
+        callback(ctx, data);
+    }
+
+    return trampoline;
+}
+
+static uint64_t
+distance(void *ptr1, void *ptr2)
+{
+    uint64_t p1 = (uint64_t)ptr1;
+    uint64_t p2 = (uint64_t)ptr2;
+
+    if (p1 > p2)
+        return p1 - p2;
+    else
+        return p2 - p1;
+}
+
+static void *
+round_page_down(void *addr)
+{
+    return (void *)((uint64_t)addr & ~(PAGE_SIZE - 1));
+}
+
+static void *
+round_page_up(void *addr)
+{
+    return (void *)(((uint64_t)addr + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1));
+}
+
+static int
+change_protection(void *addr, size_t len, int prot)
+{
+    void *beg = round_page_down(addr);
+    void *end = round_page_up(addr + len);
+
+    if (beg == end)
+        return 0;
+
+    return mprotect(beg, end - beg, prot);
+}
+
+static int
+protect_region(void *addr, size_t len)
+{
+    return change_protection(addr, len, PROT_READ | PROT_EXEC);
+}
+
+static int
+unprotect_region(void *addr, size_t len)
+{
+    return change_protection(addr, len, PROT_READ | PROT_WRITE | PROT_EXEC);
+}
+
+static void *
+map_page_rwx(void *addr)
+{
+    void *mapped = mmap(
+        addr,
+        PAGE_SIZE,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+        -1,
+        0);
+
+    if (mapped == MAP_FAILED)
+        return NULL;
+
+    if (mapped != addr)
+    {
+        munmap(mapped, PAGE_SIZE);
+        return NULL;
+    }
+
+    return mapped;
+}
+
+static page_t *
+alloc_page(void *func, void *pivot)
+{
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps)
+        return NULL;
+
+    uint64_t prev_end = 0;
+    uint64_t beg, end;
+
+    uint64_t min_distance      = UINT64_MAX;
+    void    *min_distance_page = NULL;
+
+    // Read only beginning and end of each region
+    while (fscanf(maps, "%lx-%lx %*[^\n]\n", &beg, &end) == 2)
+    {
+        // There is no gap between memory regions
+        if (beg == prev_end)
+            goto next;
+
+        void *page;
+
+        // Choose page from the gap that is closest to func
+        if ((uint64_t)func > beg)
+            page = (void *)(beg - PAGE_SIZE);
+        else
+            page = (void *)prev_end;
+
+        // We need a page less than ~2GiB away from `func` and `pivot`
+        if (distance(page, func) > ALLOWED_DISTANCE
+            || (pivot && distance(page, pivot) > ALLOWED_DISTANCE))
+            goto next;
+
+        if (distance(page, func) < min_distance)
+        {
+            min_distance      = distance(page, func);
+            min_distance_page = page;
+        }
+
+    next:
+        prev_end = end;
+    }
+
+    fclose(maps);
+
+    if (!min_distance_page)
+        return NULL;
+
+    // Map the page with PROT_READ | PROT_WRITE | PROT_EXEC
+    page_t *new_page = map_page_rwx(min_distance_page);
+    if (!new_page)
+        return NULL;
+
+    // Add newly allocated page to `page_allocator`
+    if (!page_allocator.head)
+    {
+        page_allocator.head = new_page;
+        page_allocator.tail = new_page;
+    }
+    else
+    {
+        page_allocator.tail->next = new_page;
+        new_page->prev            = page_allocator.tail;
+        page_allocator.tail       = new_page;
+    }
+
+    return new_page;
+}
+
+static void
+dealloc_page(page_t *page)
+{
+    if (page->prev)
+        page->prev->next = page->next;
+    else
+        page_allocator.head = page->next;
+
+    if (page->next)
+        page->next->prev = page->prev;
+    else
+        page_allocator.tail = page->prev;
+
+    munmap(page, PAGE_SIZE);
+}
+
+static trampoline_t *
+alloc_trampoline(void *func, void *pivot)
+{
+    uint64_t      min_distance = UINT64_MAX;
+    trampoline_t *trampoline   = NULL;
+
+    // First, search for the fitting page with the minimum distance to `func`
+    // using `page_allocator`
+    for (page_t *page = page_allocator.head; page != NULL; page = page->next)
+    {
+        // We need a page that is less than ~2GiB away from `func` and from `pivot`
+        if (distance(page, func) > ALLOWED_DISTANCE
+            || (pivot && distance(page, pivot) > ALLOWED_DISTANCE))
+            continue;
+
+        bool is_full = true;
+        int  i;
+
+        for (i = 0; i < TRAMPOLINES_PER_PAGE; i++)
+        {
+            if (page->trampolines[i].magic == 0)
+            {
+                is_full = false;
+                break;
+            }
+        }
+
+        // There are no free trampolines in this page
+        if (is_full)
+            continue;
+
+        if (distance(page, func) < min_distance)
+        {
+            min_distance = distance(page, func);
+            trampoline   = &page->trampolines[i];
+        }
+    }
+
+    // Didn't find the page in the `page_allocator`,
+    // so we try to allocate it using mmap
+    if (!trampoline)
+    {
+        page_t *page = alloc_page(func, pivot);
+        if (!page)
+            return NULL;
+
+        trampoline = &page->trampolines[0];
+    }
+
+    trampoline->magic = TRAMPOLINE_MAGIC;
+    return trampoline;
+}
+
+static void
+dealloc_trampoline(trampoline_t *trampoline)
+{
+    // We are detaching the hook while the function that it is attached to
+    // hasn't returned yet.
+    //
+    // Restoring the return address in the stack will bypass tinyhook_leave.
+    if (trampoline->retaddr)
+        *(void **)trampoline->ptr_to_retaddr = (void *)trampoline->retaddr;
+
+    void *func = trampoline->func;
+
+    unprotect_region(func, trampoline->orig_thunk_sz);
+    memcpy(func, trampoline->orig_thunk, trampoline->orig_thunk_sz);
+    protect_region(func, trampoline->orig_thunk_sz);
+
+    page_t *page    = round_page_down(trampoline);
+    bool    is_last = true;
+
+    memset(trampoline, 0, sizeof(trampoline_t));
+
+    for (int i = 0; i < TRAMPOLINES_PER_PAGE; i++)
+    {
+        if (page->trampolines[i].magic != 0)
+        {
+            is_last = false;
+            break;
+        }
+    }
+
+    // Free the page, if all it's trampolines are also freed
+    if (is_last)
+        dealloc_page(page);
+}
+
+static trampoline_t *
+get_trampoline(void *func)
+{
+    uint8_t *insns = func;
+
+    if (insns[0] != JMP_OPCODE)
+        return NULL;
+
+    void         *target     = func + *(int32_t *)(insns + 1) + 5;
+    trampoline_t *trampoline = target - offsetof(trampoline_t, insns);
+
+    // The trampoline struct can't cross the page boundary,
+    // so different pages means that the jump is not to the trampoline.
+    //
+    // Just checking the `magic` might result in a segmentation fault here,
+    // since we would be reading from a page adjacent to the function target's page.
+    if (round_page_down(target) != round_page_down(trampoline))
+        return NULL;
+
+    if (trampoline->magic != TRAMPOLINE_MAGIC)
+        return NULL;
+
+    return trampoline;
+}
+
+static void
+add_hook(trampoline_t *trampoline, tinyhook_t *hook)
+{
+    hook_list_t *list;
+
+    if (hook->is_enter)
+        list = &trampoline->pre;
+    else
+        list = &trampoline->post;
+
+    if (!list->head)
+    {
+        list->head = hook;
+        list->tail = hook;
+    }
+    else
+    {
+        list->tail->next = hook;
+        hook->prev       = list->tail;
+        list->tail       = hook;
+    }
+}
+
+static void
+remove_hook(trampoline_t *trampoline, tinyhook_t *hook)
+{
+    hook_list_t *list;
+
+    if (hook->is_enter)
+        list = &trampoline->pre;
+    else
+        list = &trampoline->post;
+
+    if (hook->prev)
+        hook->prev->next = hook->next;
+    else
+        list->head = hook->next;
+
+    if (hook->next)
+        hook->next->prev = hook->prev;
+    else
+        list->tail = hook->prev;
+}
+
+static tinyhook_t *
+create_tinyhook(void *cb, void *data, bool is_enter)
+{
+    tinyhook_t *hook = malloc(sizeof(tinyhook_t));
+    hook->is_enter   = is_enter;
+    hook->callback   = cb;
+    hook->data       = data;
+    hook->prev       = NULL;
+    hook->next       = NULL;
+    hook->trampoline = NULL;
+    return hook;
+}
+
+// TODO: REFACTOR
+
+static void
+fill_trampoline_insns(trampoline_t *trampoline, void *func, size_t insns_sz)
+{
+    ZydisEncoderRequest lea_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_LEA,
+        .operand_count = 2,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_REGISTER,
+                .reg.value = ZYDIS_REGISTER_R11,
+            },
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)trampoline - ((uint64_t)trampoline->insns.lea + LEA_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
+    ZydisEncoderRequest jmp_ptr_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_JMP,
+        .operand_count = 1,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)&trampoline->tinyhook_enter - ((uint64_t)trampoline->insns.jmp_ptr + JMP_PTR_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
+    ZydisEncoderRequest jmp_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_JMP,
+        .operand_count = 1,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_IMMEDIATE,
+                .imm.s = (uint64_t)(func + insns_sz) - ((uint64_t)trampoline->insns.jmp + JMP_SIZE),
+            },
+        },
+    };
+
+    ZydisEncoderRequest ret_lea_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_LEA,
+        .operand_count = 2,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_REGISTER,
+                .reg.value = ZYDIS_REGISTER_R11,
+            },
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)trampoline - ((uint64_t)trampoline->insns.ret_lea + LEA_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
+    ZydisEncoderRequest ret_jmp_ptr_req = {
+        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
+        .mnemonic = ZYDIS_MNEMONIC_JMP,
+        .operand_count = 1,
+        .operands = {
+            (ZydisEncoderOperand){
+                .type = ZYDIS_OPERAND_TYPE_MEMORY,
+                .mem = {
+                    .base = ZYDIS_REGISTER_RIP,
+                    .displacement = (uint64_t)&trampoline->tinyhook_leave - ((uint64_t)trampoline->insns.ret_jmp_ptr + JMP_PTR_SIZE),
+                    .size = 8,
+                },
+            },
+        },
+    };
+
+    size_t     len;
+    ZyanStatus status;
+
+    len    = sizeof(trampoline->insns.lea);
+    status = ZydisEncoderEncodeInstruction(&lea_req, trampoline->insns.lea, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.jmp_ptr);
+    status = ZydisEncoderEncodeInstruction(&jmp_ptr_req, trampoline->insns.jmp_ptr, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.jmp);
+    status = ZydisEncoderEncodeInstruction(&jmp_req, trampoline->insns.jmp, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.ret_lea);
+    status = ZydisEncoderEncodeInstruction(&ret_lea_req, trampoline->insns.ret_lea, &len);
+    assert(ZYAN_SUCCESS(status));
+
+    len    = sizeof(trampoline->insns.ret_jmp_ptr);
+    status = ZydisEncoderEncodeInstruction(&ret_jmp_ptr_req, trampoline->insns.ret_jmp_ptr, &len);
+    assert(ZYAN_SUCCESS(status));
+}
 
 static int
 get_insns(void *func, size_t func_sz, insn_t insns[JMP_SIZE], size_t *ninsns, size_t *offset)
@@ -249,393 +722,6 @@ relocate(void *func, insn_t *insns, size_t ninsns, void *buffer, size_t *buffer_
     return 0;
 }
 
-trampoline_t *
-do_pre_hooks(trampoline_t *trampoline, tinyhook_enter_context_t *ctx)
-{
-    for (tinyhook_t *hook = trampoline->pre.head; hook != NULL; hook = hook->next)
-    {
-        tinyhook_enter_callback_t callback = hook->callback;
-        void                     *data     = hook->data;
-
-        callback(ctx, data);
-    }
-
-    return trampoline;
-}
-
-trampoline_t *
-do_post_hooks(trampoline_t *trampoline, tinyhook_leave_context_t *ctx)
-{
-    for (tinyhook_t *hook = trampoline->post.head; hook != NULL; hook = hook->next)
-    {
-        tinyhook_leave_callback_t callback = hook->callback;
-        void                     *data     = hook->data;
-
-        callback(ctx, data);
-    }
-
-    return trampoline;
-}
-
-static uint64_t
-distance(void *ptr1, void *ptr2)
-{
-    uint64_t p1 = (uint64_t)ptr1;
-    uint64_t p2 = (uint64_t)ptr2;
-
-    if (p1 > p2)
-        return p1 - p2;
-    else
-        return p2 - p1;
-}
-
-static void *
-round_page_down(void *addr)
-{
-    return (void *)((uint64_t)addr & ~(PAGE_SIZE - 1));
-}
-
-static void *
-round_page_up(void *addr)
-{
-    return (void *)(((uint64_t)addr + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1));
-}
-
-static int
-change_protection(void *addr, size_t len, int prot)
-{
-    void *beg = round_page_down(addr);
-    void *end = round_page_up(addr + len);
-
-    if (beg == end)
-        return 0;
-
-    return mprotect(beg, end - beg, prot);
-}
-
-static int
-protect_region(void *addr, size_t len)
-{
-    return change_protection(addr, len, PROT_READ | PROT_EXEC);
-}
-
-static int
-unprotect_region(void *addr, size_t len)
-{
-    return change_protection(addr, len, PROT_READ | PROT_WRITE | PROT_EXEC);
-}
-
-static void *
-map_page_rwx(void *addr)
-{
-    void *mapped = mmap(
-        addr,
-        PAGE_SIZE,
-        PROT_READ | PROT_WRITE | PROT_EXEC,
-        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-        -1,
-        0);
-
-    if (mapped == MAP_FAILED)
-        return NULL;
-
-    if (mapped != addr)
-    {
-        munmap(mapped, PAGE_SIZE);
-        return NULL;
-    }
-
-    return mapped;
-}
-
-static page_t *
-alloc_page(void *func, void *pivot)
-{
-
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (!maps)
-        return NULL;
-
-    uint64_t prev_end = 0;
-    uint64_t beg, end;
-
-    uint64_t min_distance      = UINT64_MAX;
-    void    *min_distance_page = NULL;
-
-    while (fscanf(maps, "%lx-%lx %*[^\n]\n", &beg, &end) == 2)
-    {
-        if (beg == prev_end)
-            goto next;
-
-        void *page;
-
-        if ((uint64_t)func > beg)
-            page = (void *)(beg - PAGE_SIZE);
-        else
-            page = (void *)prev_end;
-
-        if (distance(page, func) > ALLOWED_DISTANCE
-            || (pivot && distance(page, pivot) > ALLOWED_DISTANCE))
-            goto next;
-
-        if (distance(page, func) < min_distance)
-        {
-            min_distance      = distance(page, func);
-            min_distance_page = page;
-        }
-
-    next:
-        prev_end = end;
-    }
-
-    fclose(maps);
-
-    if (!min_distance_page)
-        return NULL;
-
-    page_t *new_page = map_page_rwx(min_distance_page);
-    if (!new_page)
-        return NULL;
-
-    if (!page_allocator.head)
-    {
-        page_allocator.head = new_page;
-        page_allocator.tail = new_page;
-    }
-    else
-    {
-        page_allocator.tail->next = new_page;
-        new_page->prev            = page_allocator.tail;
-        page_allocator.tail       = new_page;
-    }
-
-    return new_page;
-}
-
-static void
-dealloc_page(page_t *page)
-{
-    if (page->prev)
-        page->prev->next = page->next;
-    else
-        page_allocator.head = page->next;
-
-    if (page->next)
-        page->next->prev = page->prev;
-    else
-        page_allocator.tail = page->prev;
-
-    munmap(page, PAGE_SIZE);
-}
-
-static trampoline_t *
-alloc_trampoline(void *func, void *pivot)
-{
-    uint64_t      min_distance = UINT64_MAX;
-    trampoline_t *trampoline   = NULL;
-
-    for (page_t *page = page_allocator.head; page != NULL; page = page->next)
-    {
-        if (distance(page, func) > ALLOWED_DISTANCE
-            || (pivot && distance(page, pivot) > ALLOWED_DISTANCE))
-            continue;
-
-        bool is_full = true;
-        int  i;
-
-        for (i = 0; i < TRAMPOLINES_PER_PAGE; i++)
-        {
-            if (page->trampolines[i].magic == 0)
-            {
-                is_full = false;
-                break;
-            }
-        }
-
-        if (is_full)
-            continue;
-
-        if (distance(page, func) < min_distance)
-        {
-            min_distance = distance(page, func);
-            trampoline   = &page->trampolines[i];
-        }
-    }
-
-    if (!trampoline)
-    {
-        page_t *page = alloc_page(func, pivot);
-        if (!page)
-            return NULL;
-
-        trampoline = &page->trampolines[0];
-    }
-
-    trampoline->magic = TRAMPOLINE_MAGIC;
-    return trampoline;
-}
-
-static void
-dealloc_trampoline(trampoline_t *trampoline)
-{
-    if (trampoline->ret)
-        *(void **)trampoline->ret_stackaddr = (void *)trampoline->ret;
-
-    void *func = trampoline->func;
-
-    unprotect_region(func, trampoline->replaced_prologue_size);
-    memcpy(func, trampoline->replaced_prologue, trampoline->replaced_prologue_size);
-    protect_region(func, trampoline->replaced_prologue_size);
-
-    page_t *page    = round_page_down(trampoline);
-    bool    is_last = true;
-
-    memset(trampoline, 0, sizeof(trampoline_t));
-
-    for (int i = 0; i < TRAMPOLINES_PER_PAGE; i++)
-    {
-        if (page->trampolines[i].magic != 0)
-        {
-            is_last = false;
-            break;
-        }
-    }
-
-    if (is_last)
-        dealloc_page(page);
-}
-
-static trampoline_t *
-get_trampoline(void *func)
-{
-    uint8_t *insns = func;
-
-    if (insns[0] != JMP_OPCODE)
-        return NULL;
-
-    void         *target     = func + *(int32_t *)(insns + 1) + 5;
-    trampoline_t *trampoline = target - offsetof(trampoline_t, insns);
-
-    if (round_page_down(target) != round_page_down(trampoline))
-        return NULL;
-
-    if (trampoline->magic != TRAMPOLINE_MAGIC)
-        return NULL;
-
-    return trampoline;
-}
-
-static void
-fill_trampoline_insns(trampoline_t *trampoline, void *func, size_t insns_sz)
-{
-    ZydisEncoderRequest lea_req = {
-        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
-        .mnemonic = ZYDIS_MNEMONIC_LEA,
-        .operand_count = 2,
-        .operands = {
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_REGISTER,
-                .reg.value = ZYDIS_REGISTER_R11,
-            },
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_MEMORY,
-                .mem = {
-                    .base = ZYDIS_REGISTER_RIP,
-                    .displacement = (uint64_t)trampoline - ((uint64_t)trampoline->insns.lea + LEA_SIZE),
-                    .size = 8,
-                },
-            },
-        },
-    };
-
-    ZydisEncoderRequest jmp_ptr_req = {
-        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
-        .mnemonic = ZYDIS_MNEMONIC_JMP,
-        .operand_count = 1,
-        .operands = {
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_MEMORY,
-                .mem = {
-                    .base = ZYDIS_REGISTER_RIP,
-                    .displacement = (uint64_t)&trampoline->tinyhook_enter - ((uint64_t)trampoline->insns.jmp_ptr + JMP_PTR_SIZE),
-                    .size = 8,
-                },
-            },
-        },
-    };
-
-    ZydisEncoderRequest jmp_req = {
-        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
-        .mnemonic = ZYDIS_MNEMONIC_JMP,
-        .operand_count = 1,
-        .operands = {
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_IMMEDIATE,
-                .imm.s = (uint64_t)(func + insns_sz) - ((uint64_t)trampoline->insns.jmp + JMP_SIZE),
-            },
-        },
-    };
-
-    ZydisEncoderRequest ret_lea_req = {
-        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
-        .mnemonic = ZYDIS_MNEMONIC_LEA,
-        .operand_count = 2,
-        .operands = {
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_REGISTER,
-                .reg.value = ZYDIS_REGISTER_R11,
-            },
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_MEMORY,
-                .mem = {
-                    .base = ZYDIS_REGISTER_RIP,
-                    .displacement = (uint64_t)trampoline - ((uint64_t)trampoline->insns.ret_lea + LEA_SIZE),
-                    .size = 8,
-                },
-            },
-        },
-    };
-
-    ZydisEncoderRequest ret_jmp_ptr_req = {
-        .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
-        .mnemonic = ZYDIS_MNEMONIC_JMP,
-        .operand_count = 1,
-        .operands = {
-            (ZydisEncoderOperand){
-                .type = ZYDIS_OPERAND_TYPE_MEMORY,
-                .mem = {
-                    .base = ZYDIS_REGISTER_RIP,
-                    .displacement = (uint64_t)&trampoline->tinyhook_leave - ((uint64_t)trampoline->insns.ret_jmp_ptr + JMP_PTR_SIZE),
-                    .size = 8,
-                },
-            },
-        },
-    };
-
-    size_t     len;
-    ZyanStatus status;
-
-    len    = sizeof(trampoline->insns.lea);
-    status = ZydisEncoderEncodeInstruction(&lea_req, trampoline->insns.lea, &len);
-    assert(ZYAN_SUCCESS(status));
-
-    len    = sizeof(trampoline->insns.jmp_ptr);
-    status = ZydisEncoderEncodeInstruction(&jmp_ptr_req, trampoline->insns.jmp_ptr, &len);
-    assert(ZYAN_SUCCESS(status));
-
-    len    = sizeof(trampoline->insns.jmp);
-    status = ZydisEncoderEncodeInstruction(&jmp_req, trampoline->insns.jmp, &len);
-    assert(ZYAN_SUCCESS(status));
-
-    len    = sizeof(trampoline->insns.ret_lea);
-    status = ZydisEncoderEncodeInstruction(&ret_lea_req, trampoline->insns.ret_lea, &len);
-    assert(ZYAN_SUCCESS(status));
-
-    len    = sizeof(trampoline->insns.ret_jmp_ptr);
-    status = ZydisEncoderEncodeInstruction(&ret_jmp_ptr_req, trampoline->insns.ret_jmp_ptr, &len);
-    assert(ZYAN_SUCCESS(status));
-}
-
 static trampoline_t *
 create_trampoline(void *func)
 {
@@ -654,8 +740,8 @@ create_trampoline(void *func)
     if (!trampoline)
         return NULL;
 
-    memcpy(trampoline->replaced_prologue, func, insns_sz);
-    trampoline->replaced_prologue_size = insns_sz;
+    memcpy(trampoline->orig_thunk, func, insns_sz);
+    trampoline->orig_thunk_sz = insns_sz;
 
     trampoline->tinyhook_enter = tinyhook_enter;
     trampoline->tinyhook_leave = tinyhook_leave;
@@ -663,7 +749,7 @@ create_trampoline(void *func)
 
     size_t len = MAX_RELOCATED_SIZE;
 
-    ret = relocate(func, insns, ninsns, trampoline->insns.prologue, &len);
+    ret = relocate(func, insns, ninsns, trampoline->insns.thunk, &len);
     if (ret < 0)
     {
         dealloc_trampoline(trampoline);
@@ -671,16 +757,11 @@ create_trampoline(void *func)
     }
 
     if (len < MAX_RELOCATED_SIZE)
-        ZydisEncoderNopFill(trampoline->insns.prologue + len, MAX_RELOCATED_SIZE - len);
+        ZydisEncoderNopFill(trampoline->insns.thunk + len, MAX_RELOCATED_SIZE - len);
 
     fill_trampoline_insns(trampoline, func, insns_sz);
 
-    ret = unprotect_region(func, insns_sz);
-    if (ret < 0)
-    {
-        dealloc_trampoline(trampoline);
-        return NULL;
-    }
+    unprotect_region(func, insns_sz);
 
     ZydisEncoderRequest jmp_trampoline_req = {
         .machine_mode = ZYDIS_MACHINE_MODE_LONG_64,
@@ -698,75 +779,20 @@ create_trampoline(void *func)
     ZyanStatus status = ZydisEncoderEncodeInstruction(&jmp_trampoline_req, func, &len);
     assert(ZYAN_SUCCESS(status));
 
-    if (insns_sz > JMP_SIZE)
-        ZydisEncoderNopFill(func + JMP_SIZE, insns_sz - JMP_SIZE);
+    if (len < insns_sz)
+        ZydisEncoderNopFill(func + len, insns_sz - len);
 
     protect_region(func, insns_sz);
 
     return trampoline;
 }
 
+// !REFACTOR
+
 static trampoline_t *
 get_or_create_trampoline(void *func)
 {
     return get_trampoline(func) ?: create_trampoline(func);
-}
-
-static void
-add_hook(trampoline_t *trampoline, tinyhook_t *hook)
-{
-    hook_list_t *list;
-
-    if (hook->is_enter)
-        list = &trampoline->pre;
-    else
-        list = &trampoline->post;
-
-    if (!list->head)
-    {
-        list->head = hook;
-        list->tail = hook;
-    }
-    else
-    {
-        list->tail->next = hook;
-        hook->prev       = list->tail;
-        list->tail       = hook;
-    }
-}
-
-static void
-remove_hook(trampoline_t *trampoline, tinyhook_t *hook)
-{
-    hook_list_t *list;
-
-    if (hook->is_enter)
-        list = &trampoline->pre;
-    else
-        list = &trampoline->post;
-
-    if (hook->prev)
-        hook->prev->next = hook->next;
-    else
-        list->head = hook->next;
-
-    if (hook->next)
-        hook->next->prev = hook->prev;
-    else
-        list->tail = hook->prev;
-}
-
-static tinyhook_t *
-create_tinyhook(void *cb, void *data, bool is_enter)
-{
-    tinyhook_t *hook = malloc(sizeof(tinyhook_t));
-    hook->is_enter   = is_enter;
-    hook->callback   = cb;
-    hook->data       = data;
-    hook->prev       = NULL;
-    hook->next       = NULL;
-    hook->trampoline = NULL;
-    return hook;
 }
 
 tinyhook_t *
@@ -784,6 +810,9 @@ tinyhook_create_leave(tinyhook_leave_callback_t cb, void *data)
 int
 tinyhook_attach(tinyhook_t *hook, void *func)
 {
+    if (hook->trampoline)
+        return -1;
+
     trampoline_t *trampoline = get_or_create_trampoline(func);
     if (!trampoline)
         return -1;
