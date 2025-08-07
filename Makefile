@@ -6,7 +6,7 @@ LIBS=-lZydis
 
 INSTALL=./devkit
 
-EXAMPLES=examples/malloc examples/simple examples/overhead examples/recursion
+EXAMPLES=examples/malloc examples/simple examples/overhead examples/recursion examples/bench
 
 .PHONY: all install clean
 
