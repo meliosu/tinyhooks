@@ -1,0 +1,14 @@
+BasedOnStyle: GNU
+IndentWidth: 4
+SpaceBeforeParens: ControlStatements
+UseTab: Never
+AlignConsecutiveDeclarations: Consecutive
+AlignConsecutiveAssignments: Consecutive
+SortIncludes: false
+ColumnLimit: 100
+AlignArrayOfStructures: Left
+BreakBeforeBraces: Allman
+BinPackArguments: false
+BinPackParameters: false
+AllowAllArgumentsOnNextLine: true
+AlignAfterOpenBracket: AlwaysBreak
